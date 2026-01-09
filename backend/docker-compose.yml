@@ -1,0 +1,73 @@
+version: '3.8'
+
+services:
+  # ------------------------------------------------
+  # 1. BASE DE DATOS FRÍA (PostgreSQL)
+  # ------------------------------------------------
+  db:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    env_file:
+      - .env
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ------------------------------------------------
+  # 2. BASE DE DATOS CALIENTE (Redis)
+  # ------------------------------------------------
+  redis:
+    image: redis:alpine
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ------------------------------------------------
+  # 3. BACKEND API (FastAPI - Para Alexa/Web)
+  # ------------------------------------------------
+  api:
+    build: .
+    image: bms-backend-image:latest # Nombre para que Portainer lo identifique
+    container_name: bms_api
+    restart: unless-stopped
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "2110:8000" # Exponemos el puerto 2110
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ------------------------------------------------
+  # 4. WORKER (El recolector de datos ESP32)
+  # ------------------------------------------------
+  worker:
+    build: . # Reusa la misma imagen de arriba
+    image: bms-backend-image:latest
+    container_name: bms_worker
+    restart: unless-stopped
+    command: python -m app.worker # Ejecuta el script de polling
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  redis_data:
