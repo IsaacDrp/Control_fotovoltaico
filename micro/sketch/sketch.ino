@@ -1,18 +1,19 @@
-/*
- * MONITOR BMS DUAL - VERSIÓN "REENSAMBLAJE DE PAQUETES"
- * Soluciona: Lecturas parciales, SOC 0 y Corriente 0.
- */
-
 #include <WiFi.h>
 #include <WebServer.h> 
 #include <ArduinoJson.h>
 #include "BLEDevice.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
 
-// ===========================================
-// --- CONFIGURACION ---
-// ===========================================
+// --- LIBRERÍA PARA EVITAR REINICIOS POR VOLTAJE ---
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+
+// ... (El resto de tus configuraciones de IP/MAC siguen igual) ...
 const char* ssid = "INFINITUM5F53";
 const char* password = "aPduu6aAQq";
+
 IPAddress staticIP(192, 168, 1, 98);   
 IPAddress gateway(192, 168, 1, 254);  
 IPAddress subnet(255, 255, 255, 0);   
@@ -25,14 +26,7 @@ const int PIN_RELEVADOR = 33;
 const int INVERSOR_ON_STATE = LOW;
 const int INVERSOR_OFF_STATE = HIGH;
 
-static BLEUUID SERVICE_UUID("0000ff00-0000-1000-8000-00805f9b34fb");
-static BLEUUID READ_UUID("0000ff01-0000-1000-8000-00805f9b34fb");
-static BLEUUID WRITE_UUID("0000ff02-0000-1000-8000-00805f9b34fb");
-static BLEUUID CCCD_UUID((uint16_t)0x2902); 
-
-static uint8_t COMMAND_BASIC[] = {0xDD, 0xA5, 0x03, 0x00, 0xFF, 0xFD, 0x77};
-static uint8_t COMMAND_CELLS[] = {0xDD, 0xA5, 0x04, 0x00, 0xFF, 0xFC, 0x77};
-
+// Estructuras y Globales (IGUAL QUE ANTES)
 struct BMSData {
   String name;
   String mac;
@@ -43,251 +37,222 @@ struct BMSData {
   float cell_voltages[4] = {0.0, 0.0, 0.0, 0.0}; 
   float current = 0.0;
   int soc = 0;
-  bool valid_data = false; 
+  unsigned long last_update_ms = 0; 
 };
 
-BMSData bmsData[2];
+BMSData bmsDataShared[2]; 
+SemaphoreHandle_t dataMutex; 
 WebServer server(80);
-BLEClient* pClient = nullptr; 
 
-// Buffers Globales
-static uint8_t g_packet_buffer[60]; // Buffer grande para unir los pedazos
-static int g_buffer_index = 0;
-static bool g_data_received = false;
-static int g_current_bms_index = 0;
-static uint8_t g_current_cmd = 0;
+// UUIDs (IGUAL QUE ANTES)
+static BLEUUID SERVICE_UUID("0000ff00-0000-1000-8000-00805f9b34fb");
+static BLEUUID READ_UUID("0000ff01-0000-1000-8000-00805f9b34fb");
+static BLEUUID WRITE_UUID("0000ff02-0000-1000-8000-00805f9b34fb");
+static uint8_t COMMAND_BASIC[] = {0xDD, 0xA5, 0x03, 0x00, 0xFF, 0xFD, 0x77};
+static uint8_t COMMAND_CELLS[] = {0xDD, 0xA5, 0x04, 0x00, 0xFF, 0xFC, 0x77};
 
-// ==========================================================
-// --- PARSER ---
-// ==========================================================
-void parsePacket(int bmsIndex, uint8_t* data, size_t length) {
-    BMSData &bms = bmsData[bmsIndex];
-    
-    // --- CELDAS (0x04) ---
-    if (g_current_cmd == 0x04 && data[1] == 0x04) {
-        int data_len = data[3];
-        bms.cell_count = data_len / 2;
-        float total = 0;
-        for(int i = 0; i < bms.cell_count && i < 4; i++) {
-            int offset = 4 + (i * 2);
-            uint16_t val = (data[offset] << 8) | data[offset + 1];
-            bms.cell_voltages[i] = (float)val / 1000.0;
-            total += bms.cell_voltages[i];
+// --- LOGICA BLE (Copia exacta de la versión anterior "ANTI-CRASH") ---
+BLEClient* pClient = nullptr;
+BMSData tempBmsRead; 
+volatile bool g_data_received = false;
+uint8_t g_rx_buffer[256];
+int g_rx_len = 0;
+uint8_t g_current_cmd = 0;
+
+static void notifyCallback(BLERemoteCharacteristic* pChar, uint8_t* pData, size_t length, bool isNotify) {
+    if (g_rx_len + length > 255) g_rx_len = 0;
+    memcpy(&g_rx_buffer[g_rx_len], pData, length);
+    g_rx_len += length;
+    if (g_rx_len > 5 && g_rx_buffer[g_rx_len-1] == 0x77) g_data_received = true;
+}
+
+void processBuffer() {
+    if (g_rx_buffer[0] != 0xDD) {
+        for(int i=0; i<g_rx_len; i++){
+             if(g_rx_buffer[i] == 0xDD) {
+                 int newLen = g_rx_len - i;
+                 memmove(g_rx_buffer, &g_rx_buffer[i], newLen);
+                 g_rx_len = newLen;
+                 break;
+             }
         }
-        bms.voltage = total; 
-    } 
-    // --- INFO BÁSICA (0x03) ---
-    else if (g_current_cmd == 0x03 && data[1] == 0x03) {
-        // Aunque el paquete llegue partido, aquí ya lo tenemos unido
-        if (length < 24) return; 
+    }
+    if (g_rx_buffer[0] != 0xDD) return;
+    uint8_t dataLen = g_rx_buffer[3];
+    int expectedLen = 4 + dataLen + 3;
+    if (g_rx_len < expectedLen) return;
 
-        // Voltaje
-        float v = (float)((uint16_t)((data[4] << 8) | data[5])) / 100.0;
-        if (bms.voltage == 0) bms.voltage = v; // Usar este si no hay lectura de celdas
-
-        // Corriente (Signed 16-bit)
-        bms.current = (float)((int16_t)((data[6] << 8) | data[7])) / 100.0;
-        
-        // Capacidad
-        float cap_rem = (float)((uint16_t)((data[8] << 8) | data[9])) / 100.0;
-        float cap_nom = (float)((uint16_t)((data[10] << 8) | data[11])) / 100.0;
-        
-        // SOC: Intentamos leer byte 23
+    if (g_current_cmd == 0x03) {
+        uint16_t v = (g_rx_buffer[4] << 8) | g_rx_buffer[5];
+        if (tempBmsRead.voltage == 0) tempBmsRead.voltage = v / 100.0;
+        int16_t c = (int16_t)((g_rx_buffer[6] << 8) | g_rx_buffer[7]);
+        tempBmsRead.current = c / 100.0;
+        uint16_t cap_full = (g_rx_buffer[10] << 8) | g_rx_buffer[11];
+        uint16_t cap_now = (g_rx_buffer[8] << 8) | g_rx_buffer[9];
         int soc = 0;
-        if (length > 23) soc = (int)data[23];
-        
-        // PLAN B: Si SOC es 0 o inválido, calcular por voltaje (LiFePO4 aprox)
+        if (dataLen >= 19) soc = g_rx_buffer[23];
         if (soc <= 0 || soc > 100) {
-            if (cap_nom > 0) {
-                soc = (int)((cap_rem / cap_nom) * 100.0);
-            } else {
-                // Estimación cruda por voltaje (4 celdas)
-                if (bms.voltage > 13.6) soc = 100;
-                else if (bms.voltage > 13.4) soc = 90;
-                else if (bms.voltage > 13.3) soc = 70;
-                else if (bms.voltage > 13.2) soc = 40;
-                else soc = 20;
+            if (cap_full > 0) soc = (int)(((float)cap_now / (float)cap_full) * 100.0);
+            else { 
+                if (tempBmsRead.voltage > 13.4) soc = 100;
+                else if (tempBmsRead.voltage > 12.0) soc = 50;
+                else soc = 0;
             }
         }
-        bms.soc = soc;
+        tempBmsRead.soc = soc;
+        if (tempBmsRead.current < -0.2) tempBmsRead.status = "Descargando";
+        else if (tempBmsRead.current > 0.2) tempBmsRead.status = "Cargando";
+        else tempBmsRead.status = "Standby";
 
-        // Estado (Umbral bajado a 0.15A para detectar cargas pequeñas)
-        if (bms.current < -0.15) bms.status = "Descargando";
-        else if (bms.current > 0.15) bms.status = "Cargando";
-        else bms.status = "Reposo";
-
-        bms.valid_data = true;
-    }
-}
-
-// CALLBACK INTELIGENTE: Pega los pedazos
-static void notifyCallback(BLERemoteCharacteristic* pChar, uint8_t* pData, size_t length, bool isNotify) {
-  for (int i = 0; i < length; i++) {
-    uint8_t b = pData[i];
-    
-    // Si encontramos el inicio de trama, reseteamos el índice
-    if (b == 0xDD) {
-      g_buffer_index = 0; 
-      g_packet_buffer[g_buffer_index++] = b;
-    } 
-    // Si no es inicio, seguimos llenando el buffer
-    else if (g_buffer_index > 0 && g_buffer_index < 59) {
-      g_packet_buffer[g_buffer_index++] = b;
-    }
-
-    // Si encontramos el final (0x77) Y tenemos una longitud decente, procesamos
-    if (b == 0x77 && g_buffer_index > 3) {
-      parsePacket(g_current_bms_index, g_packet_buffer, g_buffer_index);
-      g_data_received = true; 
-      // No reseteamos g_buffer_index aquí, esperamos al próximo DD
-    }
-  }
-}
-
-// ==========================================================
-// --- LECTURA ---
-// ==========================================================
-
-bool readBMS(int index) {
-    g_current_bms_index = index;
-    BMSData &bms = bmsData[index];
-    bms.valid_data = false;
-    
-    // Creamos cliente nuevo
-    if (pClient == nullptr) pClient = BLEDevice::createClient();
-
-    if (!pClient->connect(BLEAddress(bms.mac.c_str()))) {
-        bms.isConnected = false;
-        bms.status = "Error Conexión";
-        return false;
-    }
-
-    // Solicitar MTU mayor (Aunque el BMS lo ignore, ayuda al stack del ESP32)
-    pClient->setMTU(256);
-
-    BLERemoteService* pService = pClient->getService(SERVICE_UUID);
-    if (pService == nullptr) { pClient->disconnect(); return false; }
-    
-    BLERemoteCharacteristic* pWrite = pService->getCharacteristic(WRITE_UUID);
-    BLERemoteCharacteristic* pRead = pService->getCharacteristic(READ_UUID);
-    if (!pWrite || !pRead) { pClient->disconnect(); return false; }
-
-    if (pRead->canNotify()) {
-        pRead->registerForNotify(notifyCallback);
-        delay(50);
-        BLERemoteDescriptor* pCCCD = pRead->getDescriptor(CCCD_UUID);
-        if(pCCCD) {
-             uint8_t val[] = {0x01, 0x00};
-             pCCCD->writeValue(val, 2, true);
+    } else if (g_current_cmd == 0x04) {
+        tempBmsRead.cell_count = dataLen / 2;
+        float total = 0;
+        for(int k=0; k < tempBmsRead.cell_count && k < 4; k++) {
+            int offset = 4 + (k*2);
+            uint16_t val = (g_rx_buffer[offset] << 8) | g_rx_buffer[offset+1];
+            tempBmsRead.cell_voltages[k] = (float)val / 1000.0;
+            total += tempBmsRead.cell_voltages[k];
         }
-    }
-    delay(100); 
-
-    // --- LECTURA ROBUSTA (Timeout largo) ---
-    // Intentamos 2 veces leer Info Básica
-    for(int k=0; k<2; k++) {
-        g_current_cmd = 0x03;
-        g_data_received = false;
-        pWrite->writeValue(COMMAND_BASIC, sizeof(COMMAND_BASIC), false);
-        
-        // Esperamos HASTA 2.5 SEGUNDOS para que lleguen todos los pedazos
-        unsigned long start = millis();
-        while (!g_data_received && millis() - start < 2500) { delay(10); }
-        
-        if (g_data_received) break; // Ya tenemos datos, salir del loop
-    }
-
-    // Celdas (Es rápido, 1 seg basta)
-    g_current_cmd = 0x04;
-    g_data_received = false;
-    pWrite->writeValue(COMMAND_CELLS, sizeof(COMMAND_CELLS), false);
-    unsigned long start = millis();
-    while (!g_data_received && millis() - start < 1500) { delay(10); }
-
-    pClient->disconnect();
-    bms.isConnected = true;
-    return true;
-}
-
-void performScan() {
-    readBMS(0); 
-    delay(200); 
-    readBMS(1); 
-    // Limpieza de memoria agresiva
-    if (pClient != nullptr) {
-        delete pClient;
-        pClient = nullptr;
+        if (total > 0) tempBmsRead.voltage = total;
     }
 }
 
-// ==========================================================
-// --- ENDPOINTS ---
-// ==========================================================
+void processBMS(int index, String macAddress) {
+    tempBmsRead.name = (index == 0) ? "Bat 1" : "Bat 2";
+    tempBmsRead.mac = macAddress;
+    tempBmsRead.voltage = 0; 
+    
+    if (pClient->connect(BLEAddress(macAddress.c_str()))) {
+        tempBmsRead.isConnected = true;
+        pClient->setMTU(517); 
+        vTaskDelay(100 / portTICK_PERIOD_MS);
 
+        BLERemoteService* pService = pClient->getService(SERVICE_UUID);
+        if (pService) {
+            BLERemoteCharacteristic* pWrite = pService->getCharacteristic(WRITE_UUID);
+            BLERemoteCharacteristic* pRead = pService->getCharacteristic(READ_UUID);
+            if (pWrite && pRead && pRead->canNotify()) {
+                pRead->registerForNotify(notifyCallback);
+                vTaskDelay(100 / portTICK_PERIOD_MS);
+                
+                // CMD 0x03
+                g_rx_len = 0; g_current_cmd = 0x03; g_data_received = false;
+                pWrite->writeValue(COMMAND_BASIC, sizeof(COMMAND_BASIC), false);
+                unsigned long t = millis();
+                while(!g_data_received && millis() - t < 1000) { vTaskDelay(10 / portTICK_PERIOD_MS); }
+                if (!g_data_received) {
+                    vTaskDelay(100 / portTICK_PERIOD_MS);
+                    pWrite->writeValue(COMMAND_BASIC, sizeof(COMMAND_BASIC), false);
+                    t = millis();
+                    while(!g_data_received && millis() - t < 1000) { vTaskDelay(10 / portTICK_PERIOD_MS); }
+                }
+                if (g_data_received) processBuffer();
+
+                // CMD 0x04
+                g_rx_len = 0; g_current_cmd = 0x04; g_data_received = false;
+                pWrite->writeValue(COMMAND_CELLS, sizeof(COMMAND_CELLS), false);
+                t = millis();
+                while(!g_data_received && millis() - t < 1000) { vTaskDelay(10 / portTICK_PERIOD_MS); }
+                if (g_data_received) processBuffer();
+            }
+        }
+        pClient->disconnect();
+    } else {
+        tempBmsRead.isConnected = false;
+        tempBmsRead.status = "Desconectado";
+    }
+
+    tempBmsRead.last_update_ms = millis();
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    bmsDataShared[index] = tempBmsRead;
+    xSemaphoreGive(dataMutex);
+    vTaskDelay(250 / portTICK_PERIOD_MS);
+}
+
+void taskBMSReader(void *pvParameters) {
+    pClient = BLEDevice::createClient();
+    while(1) {
+        processBMS(0, BMS_MAC_1);
+        processBMS(1, BMS_MAC_2);
+        vTaskDelay(2000 / portTICK_PERIOD_MS);
+    }
+}
+
+// --- LOGICA WEB (IGUAL QUE ANTES) ---
 void handleStatus() {
-    performScan(); 
-
-    StaticJsonDocument<2048> doc;
+    StaticJsonDocument<2500> doc;
     float total_power = 0;
     JsonArray batteries = doc.createNestedArray("batteries");
 
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
     for(int i=0; i<2; i++) {
         JsonObject bms = batteries.createNestedObject();
-        bms["name"] = bmsData[i].name;
-        bms["connected"] = bmsData[i].isConnected;
-        
-        if (bmsData[i].isConnected) {
-            bms["status"] = bmsData[i].status;
-            bms["voltage"] = bmsData[i].voltage;
-            bms["current"] = bmsData[i].current;
-            bms["soc"] = bmsData[i].soc;
-            float p = bmsData[i].voltage * bmsData[i].current;
-            bms["power"] = p;
-            total_power += p;
-            
-            JsonArray cells = bms.createNestedArray("cells");
-            for(int j=0; j<4; j++) cells.add(bmsData[i].cell_voltages[j]);
-        }
+        bms["name"] = bmsDataShared[i].name;
+        bms["mac"] = bmsDataShared[i].mac;
+        bms["connected"] = bmsDataShared[i].isConnected;
+        bms["status"] = bmsDataShared[i].status;
+        bms["voltage"] = bmsDataShared[i].voltage;
+        bms["current"] = bmsDataShared[i].current;
+        bms["soc"] = bmsDataShared[i].soc;
+        bms["age_ms"] = millis() - bmsDataShared[i].last_update_ms;
+        float p = bmsDataShared[i].voltage * bmsDataShared[i].current;
+        bms["power"] = p;
+        total_power += p;
+        JsonArray cells = bms.createNestedArray("cells");
+        for(int j=0; j<4; j++) cells.add(bmsDataShared[i].cell_voltages[j]);
     }
+    xSemaphoreGive(dataMutex);
 
     doc["summary"]["total_power"] = total_power;
-    bool is_on = (digitalRead(PIN_RELEVADOR) == INVERSOR_ON_STATE);
-    doc["inverter"]["on"] = is_on;
-    
+    doc["summary"]["uptime"] = millis();
+    doc["inverter"]["on"] = (digitalRead(PIN_RELEVADOR) == INVERSOR_ON_STATE);
     String output;
     serializeJson(doc, output);
     server.send(200, "application/json", output);
 }
+void handleOn() { digitalWrite(PIN_RELEVADOR, INVERSOR_ON_STATE); server.send(200, "application/json", "{\"inverter\": true}"); }
+void handleOff() { digitalWrite(PIN_RELEVADOR, INVERSOR_OFF_STATE); server.send(200, "application/json", "{\"inverter\": false}"); }
 
-void handleOn() {
-    digitalWrite(PIN_RELEVADOR, INVERSOR_ON_STATE);
-    server.send(200, "text/plain", "OK: ON");
-}
-
-void handleOff() {
-    digitalWrite(PIN_RELEVADOR, INVERSOR_OFF_STATE);
-    server.send(200, "text/plain", "OK: OFF");
-}
-
+// --- SETUP MODIFICADO (SOLUCIÓN POWERON_RESET) ---
 void setup() {
+    // 1. DESACTIVAR BROWNOUT DETECTOR (Truco de Software)
+    // Esto evita que el ESP32 se reinicie si el voltaje baja momentáneamente
+    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); 
+    
     Serial.begin(115200);
+    
+    // 2. RETRASAR ENCENDIDO DEL RELÉ
+    // Inicializamos APAGADO para no consumir corriente en el arranque WiFi
     pinMode(PIN_RELEVADOR, OUTPUT);
-    digitalWrite(PIN_RELEVADOR, INVERSOR_ON_STATE);
+    digitalWrite(PIN_RELEVADOR, INVERSOR_OFF_STATE); 
 
-    bmsData[0].name = "Bat 1"; bmsData[0].mac = BMS_MAC_1;
-    bmsData[1].name = "Bat 2"; bmsData[1].mac = BMS_MAC_2;
+    dataMutex = xSemaphoreCreateMutex();
+    bmsDataShared[0].name = "Bat 1"; bmsDataShared[1].name = "Bat 2";
 
     WiFi.mode(WIFI_STA);
     WiFi.config(staticIP, gateway, subnet, primaryDNS);
     WiFi.begin(ssid, password);
-    while (WiFi.status() != WL_CONNECTED) delay(500);
     
-    server.on("/status", HTTP_GET, handleStatus);
-    server.on("/on", HTTP_GET, handleOn);
-    server.on("/off", HTTP_GET, handleOff);
-    server.begin();
+    // Esperamos WiFi SIN encender el relé aún
+    Serial.print("Conectando WiFi");
+    while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+    Serial.println("\nWiFi OK.");
 
-    BLEDevice::init("ESP32_Gateway");
+    // 3. AHORA QUE EL WIFI ESTÁ ESTABLE, ENCENDEMOS EL RELÉ (Si es necesario)
+    // Pequeña pausa para asegurar que el pico del WiFi pasó
+    delay(500); 
+    digitalWrite(PIN_RELEVADOR, INVERSOR_ON_STATE); 
+    Serial.println("Relé activado.");
+
+    BLEDevice::init("ESP32_Slave");
+    xTaskCreatePinnedToCore(taskBMSReader, "BMS_Task", 20000, NULL, 1, NULL, 1);
+
+    server.on("/status", HTTP_GET, handleStatus);
+    server.on("/on", HTTP_GET, handleOn);   
+    server.on("/on", HTTP_POST, handleOn);
+    server.on("/off", HTTP_GET, handleOff);
+    server.on("/off", HTTP_POST, handleOff);
+    server.begin();
 }
 
 void loop() {

@@ -80,7 +80,7 @@ def save_history():
 
 # --- PLANIFICACIÓN ---
 # Ejecutar polling cada 5 segundos
-schedule.every(120).seconds.do(fetch_and_store)
+schedule.every(10).seconds.do(fetch_and_store)
 
 # Ejecutar guardado histórico cada 1 minuto
 schedule.every(4).minutes.do(save_history)
