@@ -1,6 +1,16 @@
+/*
+ * MONITOR BMS DUAL - VERSIÓN FINAL "PERSISTENCIA DE ESTADO (NVS)"
+ * * Características:
+ * 1. Persistencia: Recuerda estado ON/OFF del inversor tras reinicios.
+ * 2. Watchdog: Auto-reinicio si el BLE se cuelga (5 min).
+ * 3. Heap Monitor: Diagnóstico de memoria RAM.
+ * 4. Brownout Fix: Protección de voltaje.
+ */
+
 #include <WiFi.h>
 #include <WebServer.h> 
 #include <ArduinoJson.h>
+#include <Preferences.h> // <--- NUEVO: Para guardar estado en Flash
 #include "BLEDevice.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -10,7 +20,9 @@
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
 
-// ... (El resto de tus configuraciones de IP/MAC siguen igual) ...
+// ===========================================
+// --- CONFIGURACIÓN ---
+// ===========================================
 const char* ssid = "INFINITUM5F53";
 const char* password = "aPduu6aAQq";
 
@@ -22,36 +34,41 @@ IPAddress primaryDNS(192, 168, 1, 254);
 #define BMS_MAC_1 "A5:C2:37:28:8C:99"
 #define BMS_MAC_2 "A5:C2:37:28:81:78"
 
+// Configuración Watchdog (5 minutos)
+const unsigned long MAX_STALE_MS = 300000; 
+
 const int PIN_RELEVADOR = 33; 
 const int INVERSOR_ON_STATE = LOW;
 const int INVERSOR_OFF_STATE = HIGH;
 
-// Estructuras y Globales (IGUAL QUE ANTES)
+// ===========================================
+// --- ESTRUCTURAS Y GLOBALES ---
+// ===========================================
 struct BMSData {
-  String name;
-  String mac;
-  bool isConnected = false;
-  String status = "Desconocido";
-  float voltage = 0.0; 
-  int cell_count = 0;
-  float cell_voltages[4] = {0.0, 0.0, 0.0, 0.0}; 
-  float current = 0.0;
-  int soc = 0;
-  unsigned long last_update_ms = 0; 
+  String name; String mac; bool isConnected = false;
+  String status = "Desconocido"; float voltage = 0.0; 
+  int cell_count = 0; float cell_voltages[4] = {0.0}; 
+  float current = 0.0; int soc = 0; unsigned long last_update_ms = 0; 
 };
 
 BMSData bmsDataShared[2]; 
 SemaphoreHandle_t dataMutex; 
 WebServer server(80);
 
-// UUIDs (IGUAL QUE ANTES)
+// Objeto para persistencia
+Preferences preferences;
+const char* PREF_NAMESPACE = "inv_state"; // Nombre del espacio en memoria
+
+// UUIDs
 static BLEUUID SERVICE_UUID("0000ff00-0000-1000-8000-00805f9b34fb");
 static BLEUUID READ_UUID("0000ff01-0000-1000-8000-00805f9b34fb");
 static BLEUUID WRITE_UUID("0000ff02-0000-1000-8000-00805f9b34fb");
 static uint8_t COMMAND_BASIC[] = {0xDD, 0xA5, 0x03, 0x00, 0xFF, 0xFD, 0x77};
 static uint8_t COMMAND_CELLS[] = {0xDD, 0xA5, 0x04, 0x00, 0xFF, 0xFC, 0x77};
 
-// --- LOGICA BLE (Copia exacta de la versión anterior "ANTI-CRASH") ---
+// ===========================================
+// --- LOGICA BLE ---
+// ===========================================
 BLEClient* pClient = nullptr;
 BMSData tempBmsRead; 
 volatile bool g_data_received = false;
@@ -135,7 +152,6 @@ void processBMS(int index, String macAddress) {
                 pRead->registerForNotify(notifyCallback);
                 vTaskDelay(100 / portTICK_PERIOD_MS);
                 
-                // CMD 0x03
                 g_rx_len = 0; g_current_cmd = 0x03; g_data_received = false;
                 pWrite->writeValue(COMMAND_BASIC, sizeof(COMMAND_BASIC), false);
                 unsigned long t = millis();
@@ -148,7 +164,6 @@ void processBMS(int index, String macAddress) {
                 }
                 if (g_data_received) processBuffer();
 
-                // CMD 0x04
                 g_rx_len = 0; g_current_cmd = 0x04; g_data_received = false;
                 pWrite->writeValue(COMMAND_CELLS, sizeof(COMMAND_CELLS), false);
                 t = millis();
@@ -178,11 +193,14 @@ void taskBMSReader(void *pvParameters) {
     }
 }
 
-// --- LOGICA WEB (IGUAL QUE ANTES) ---
+// ===========================================
+// --- LOGICA WEB ---
+// ===========================================
 void handleStatus() {
     StaticJsonDocument<2500> doc;
     float total_power = 0;
     JsonArray batteries = doc.createNestedArray("batteries");
+    unsigned long now = millis();
 
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     for(int i=0; i<2; i++) {
@@ -194,37 +212,70 @@ void handleStatus() {
         bms["voltage"] = bmsDataShared[i].voltage;
         bms["current"] = bmsDataShared[i].current;
         bms["soc"] = bmsDataShared[i].soc;
-        bms["age_ms"] = millis() - bmsDataShared[i].last_update_ms;
+        bms["age_ms"] = now - bmsDataShared[i].last_update_ms;
+
         float p = bmsDataShared[i].voltage * bmsDataShared[i].current;
         bms["power"] = p;
         total_power += p;
+        
         JsonArray cells = bms.createNestedArray("cells");
         for(int j=0; j<4; j++) cells.add(bmsDataShared[i].cell_voltages[j]);
     }
     xSemaphoreGive(dataMutex);
 
     doc["summary"]["total_power"] = total_power;
-    doc["summary"]["uptime"] = millis();
+    doc["summary"]["uptime_sec"] = now / 1000;
+    doc["summary"]["free_heap"] = ESP.getFreeHeap();
+    doc["summary"]["min_free_heap"] = ESP.getMinFreeHeap();
     doc["inverter"]["on"] = (digitalRead(PIN_RELEVADOR) == INVERSOR_ON_STATE);
+    
     String output;
     serializeJson(doc, output);
     server.send(200, "application/json", output);
 }
-void handleOn() { digitalWrite(PIN_RELEVADOR, INVERSOR_ON_STATE); server.send(200, "application/json", "{\"inverter\": true}"); }
-void handleOff() { digitalWrite(PIN_RELEVADOR, INVERSOR_OFF_STATE); server.send(200, "application/json", "{\"inverter\": false}"); }
 
-// --- SETUP MODIFICADO (SOLUCIÓN POWERON_RESET) ---
+void handleOn() { 
+    // Guardar Estado
+    preferences.begin(PREF_NAMESPACE, false);
+    preferences.putBool("isOn", true);
+    preferences.end();
+    
+    // Actuar
+    digitalWrite(PIN_RELEVADOR, INVERSOR_ON_STATE); 
+    server.send(200, "application/json", "{\"inverter\": true}"); 
+}
+
+void handleOff() { 
+    // Guardar Estado
+    preferences.begin(PREF_NAMESPACE, false);
+    preferences.putBool("isOn", false);
+    preferences.end();
+    
+    // Actuar
+    digitalWrite(PIN_RELEVADOR, INVERSOR_OFF_STATE); 
+    server.send(200, "application/json", "{\"inverter\": false}"); 
+}
+
+// ===========================================
+// --- SETUP ---
+// ===========================================
 void setup() {
-    // 1. DESACTIVAR BROWNOUT DETECTOR (Truco de Software)
-    // Esto evita que el ESP32 se reinicie si el voltaje baja momentáneamente
+    // 1. Protección Brownout
     WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); 
     
     Serial.begin(115200);
-    
-    // 2. RETRASAR ENCENDIDO DEL RELÉ
-    // Inicializamos APAGADO para no consumir corriente en el arranque WiFi
+
+    // 2. RECUPERAR ESTADO (NVS)
+    preferences.begin(PREF_NAMESPACE, true); 
+    bool lastState = preferences.getBool("isOn", true); 
+    preferences.end();
+
+    // 3. APLICAR ESTADO
+    int pinState = lastState ? INVERSOR_ON_STATE : INVERSOR_OFF_STATE;
+    digitalWrite(PIN_RELEVADOR, pinState);
     pinMode(PIN_RELEVADOR, OUTPUT);
-    digitalWrite(PIN_RELEVADOR, INVERSOR_OFF_STATE); 
+
+    Serial.printf("Sistema iniciado. Inversor restaurado a: %s\n", lastState ? "ON" : "OFF");
 
     dataMutex = xSemaphoreCreateMutex();
     bmsDataShared[0].name = "Bat 1"; bmsDataShared[1].name = "Bat 2";
@@ -233,16 +284,14 @@ void setup() {
     WiFi.config(staticIP, gateway, subnet, primaryDNS);
     WiFi.begin(ssid, password);
     
-    // Esperamos WiFi SIN encender el relé aún
     Serial.print("Conectando WiFi");
     while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
     Serial.println("\nWiFi OK.");
 
-    // 3. AHORA QUE EL WIFI ESTÁ ESTABLE, ENCENDEMOS EL RELÉ (Si es necesario)
-    // Pequeña pausa para asegurar que el pico del WiFi pasó
-    delay(500); 
-    digitalWrite(PIN_RELEVADOR, INVERSOR_ON_STATE); 
-    Serial.println("Relé activado.");
+    // --- FIX IMPORTANTE: PAUSA DE ESTABILIZACIÓN ---
+    Serial.println("Estabilizando energía antes de BLE...");
+    delay(2000); // <--- ESTO EVITA EL REINICIO
+    // ----------------------------------------------
 
     BLEDevice::init("ESP32_Slave");
     xTaskCreatePinnedToCore(taskBMSReader, "BMS_Task", 20000, NULL, 1, NULL, 1);
@@ -253,8 +302,38 @@ void setup() {
     server.on("/off", HTTP_GET, handleOff);
     server.on("/off", HTTP_POST, handleOff);
     server.begin();
+    
+    Serial.println("Servidor y BLE iniciados correctamente.");
 }
-
+// ===========================================
+// --- LOOP PRINCIPAL CON WATCHDOG ---
+// ===========================================
 void loop() {
     server.handleClient();
+
+    static unsigned long lastCheck = 0;
+    unsigned long now = millis();
+
+    if (now - lastCheck > 10000) {
+        lastCheck = now;
+        
+        // Esperamos 2 min antes de juzgar
+        if (now > 120000) {
+            bool needsRestart = false;
+            xSemaphoreTake(dataMutex, portMAX_DELAY);
+            unsigned long age1 = now - bmsDataShared[0].last_update_ms;
+            unsigned long age2 = now - bmsDataShared[1].last_update_ms;
+            xSemaphoreGive(dataMutex);
+
+            if (age1 > MAX_STALE_MS && age2 > MAX_STALE_MS) {
+                needsRestart = true;
+            }
+
+            if (needsRestart) {
+                Serial.println("Watchdog: Datos obsoletos. Reiniciando...");
+                delay(1000);
+                ESP.restart(); 
+            }
+        }
+    }
 }

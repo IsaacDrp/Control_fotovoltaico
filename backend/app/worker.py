@@ -23,23 +23,23 @@ print("Worker Iniciado. Conectado a Redis y Postgres.")
 def fetch_and_store():
     """Consulta al ESP32 y actualiza Redis"""
     try:
-        # 1. Pull del ESP32
-        response = requests.get(ESP32_URL, timeout=30)
+        # CAMBIO 1: Timeout de 3 segundos (Si tarda más, algo anda mal)
+        response = requests.get(ESP32_URL, timeout=3.0)
         
         if response.status_code == 200:
             data = response.json()
             
-            # 2. Guardar en REDIS (Sobrescribe 'solar:live')
+            # 2. Guardar en REDIS
             r.set("solar:live", json.dumps(data))
-            # Guardamos timestamp para saber si el dato es viejo en el frontend
             r.set("solar:last_update", str(datetime.now()))
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Dato actualizado en Redis")
-            
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Redis Actualizado.")
             return data
         else:
-            print(f"Error HTTP ESP32: {response.status_code}")
+            print(f"Advertencia: ESP32 respondió {response.status_code}")
             return None
             
+    except requests.exceptions.Timeout:
+        print("Timeout: El ESP32 tardó demasiado en responder.")
     except Exception as e:
         print(f"Error conectando al ESP32: {e}")
         return None
@@ -52,19 +52,24 @@ def save_history():
 
     data = json.loads(raw_data)
     
+    # CAMBIO 2: Protección contra arrays vacíos
+    batteries = data.get('batteries', [])
+    if len(batteries) < 2:
+        print(f"Error: Datos incompletos. Se esperaban 2 baterías, se encontraron {len(batteries)}")
+        return
+
     try:
         db = SessionLocal()
         
-        # Mapeo del JSON a la Tabla SQL
-        # Asumimos que data['batteries'][0] siempre es Bat 1
         metric = SolarMetric(
-            bat1_voltage = data['batteries'][0]['voltage'],
-            bat1_current = data['batteries'][0]['current'],
-            bat1_soc     = data['batteries'][0]['soc'],
+            # Acceso seguro ahora que validamos el length
+            bat1_voltage = batteries[0]['voltage'],
+            bat1_current = batteries[0]['current'],
+            bat1_soc     = batteries[0]['soc'],
             
-            bat2_voltage = data['batteries'][1]['voltage'],
-            bat2_current = data['batteries'][1]['current'],
-            bat2_soc     = data['batteries'][1]['soc'],
+            bat2_voltage = batteries[1]['voltage'],
+            bat2_current = batteries[1]['current'],
+            bat2_soc     = batteries[1]['soc'],
             
             total_power  = data['summary']['total_power'],
             inverter_status = data['inverter']['on']
@@ -73,11 +78,10 @@ def save_history():
         db.add(metric)
         db.commit()
         db.close()
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Histórico guardado en Postgres")
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] --> Postgres Guardado.")
         
     except Exception as e:
         print(f"Error guardando en DB: {e}")
-
 # --- PLANIFICACIÓN ---
 # Ejecutar polling cada 5 segundos
 schedule.every(10).seconds.do(fetch_and_store)
