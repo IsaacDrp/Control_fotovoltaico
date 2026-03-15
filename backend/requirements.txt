@@ -1,8 +1,0 @@
-fastapi
-uvicorn
-requests
-redis
-psycopg2-binary
-schedule
-pydantic
-sqlalchemy
