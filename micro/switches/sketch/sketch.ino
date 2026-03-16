@@ -41,9 +41,9 @@ struct Light {
 };
 
 Light lights[] = {
-  {"cuarto", 15, 14, false, HIGH},
-  {"sala", 16, 27, false, HIGH},
-  {"zotehuela", 17, 26, false, HIGH},
+  {"cuarto", 17, 14, false, HIGH},
+  {"sala", 15, 27, false, HIGH},
+  {"zotehuela", 16, 26, false, HIGH},
   {"comedor_2",     5, 33, false, HIGH},
   {"comedor_1",      18, 32, false, HIGH}  
 };
